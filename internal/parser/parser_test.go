@@ -167,6 +167,69 @@ func TestProsePreserved(t *testing.T) {
 	}
 }
 
+func TestRoundTripPreservesFormatting(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{
+			name: "inline block",
+			doc:  "Prose. <!-- secret -->my-api-key-12345<!-- /secret --> more prose.",
+		},
+		{
+			name: "inline with internal spaces",
+			doc:  "key: <!-- secret --> my-api-key-12345 <!-- /secret -->\n",
+		},
+		{
+			name: "multiline block",
+			doc:  "Before\n<!-- secret -->\nmy-api-key-12345\n<!-- /secret -->\nAfter\n",
+		},
+		{
+			name: "mixed inline and multiline",
+			doc: "# Header\n\nFirst secret: <!-- secret -->inline-secret<!-- /secret -->.\n\n" +
+				"Second:\n<!-- secret -->\nmultiline-secret\n<!-- /secret -->\n\nDone.\n",
+		},
+		{
+			name: "no trailing newline",
+			doc:  "<!-- secret -->only-content<!-- /secret -->",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			enc, err := parser.EncryptBlocks(tc.doc, encFn)
+			if err != nil {
+				t.Fatalf("EncryptBlocks: %v", err)
+			}
+			dec := parser.DecryptBlocks(enc.Text, decFn)
+			if len(dec.Errors) != 0 {
+				t.Fatalf("DecryptBlocks errors: %v", dec.Errors)
+			}
+			if dec.Text != tc.doc {
+				t.Errorf("round-trip mismatch\noriginal:  %q\ndecrypted: %q", tc.doc, dec.Text)
+			}
+		})
+	}
+}
+
+func TestEncryptPreservesInlineFormatting(t *testing.T) {
+	doc := "key: <!-- secret -->secret-value<!-- /secret --> done"
+	enc, err := parser.EncryptBlocks(doc, encFn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The encrypted form must stay inline — no newlines injected around the token.
+	if strings.Contains(enc.Text, "<!-- secret -->\n") {
+		t.Errorf("inline block was canonicalized to multiline: %q", enc.Text)
+	}
+	if !strings.HasPrefix(enc.Text, "key: <!-- secret -->") {
+		t.Errorf("prefix lost: %q", enc.Text)
+	}
+	if !strings.HasSuffix(enc.Text, "<!-- /secret --> done") {
+		t.Errorf("suffix lost: %q", enc.Text)
+	}
+}
+
 func TestWrongPassLeavesBlockIntact(t *testing.T) {
 	enc, err := parser.EncryptBlocks(plainDoc, encFn)
 	if err != nil {

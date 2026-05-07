@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/michael-dez/mdcrypt/internal/crypto"
 )
@@ -92,6 +93,18 @@ type DecryptResult struct {
 	Errors []error
 }
 
+// splitSurroundingSpace splits s into leading whitespace, trimmed content, and
+// trailing whitespace. If s is all whitespace, the entire string is returned as
+// the leading run. Used to preserve the original spacing between the secret
+// tags and their inner content across an encrypt/decrypt round trip.
+func splitSurroundingSpace(s string) (lead, mid, trail string) {
+	leftTrimmed := strings.TrimLeftFunc(s, unicode.IsSpace)
+	lead = s[:len(s)-len(leftTrimmed)]
+	mid = strings.TrimRightFunc(leftTrimmed, unicode.IsSpace)
+	trail = leftTrimmed[len(mid):]
+	return lead, mid, trail
+}
+
 // EncryptBlocks replaces each unencrypted secret block's inner content with an
 // ENC token produced by encryptFn. Already-encrypted blocks are left untouched.
 func EncryptBlocks(text string, encryptFn EncryptFn) (EncryptResult, error) {
@@ -107,23 +120,25 @@ func EncryptBlocks(text string, encryptFn EncryptFn) (EncryptResult, error) {
 		// loc[innerStart]:loc[innerEnd] = inner group
 		innerStart := loc[blockRe.SubexpIndex("inner")*2]
 		innerEnd := loc[blockRe.SubexpIndex("inner")*2+1]
-		inner := strings.TrimSpace(text[innerStart:innerEnd])
+		lead, mid, trail := splitSurroundingSpace(text[innerStart:innerEnd])
 
 		// Append text before this block
 		result.WriteString(text[pos:loc[0]])
 
-		if fullTokenRe.MatchString(inner) {
+		if fullTokenRe.MatchString(mid) {
 			// Already encrypted — leave verbatim
 			result.WriteString(text[loc[0]:loc[1]])
 		} else {
-			token, err := encryptFn(inner)
+			token, err := encryptFn(mid)
 			if err != nil {
 				encErr = fmt.Errorf("encrypting block: %w", err)
 				result.WriteString(text[loc[0]:loc[1]])
 			} else {
-				result.WriteString("<!-- secret -->\n")
+				result.WriteString("<!-- secret -->")
+				result.WriteString(lead)
 				result.WriteString(token)
-				result.WriteString("\n<!-- /secret -->")
+				result.WriteString(trail)
+				result.WriteString("<!-- /secret -->")
 				count++
 			}
 		}
@@ -147,22 +162,24 @@ func DecryptBlocks(text string, decryptFn DecryptFn) DecryptResult {
 	for _, loc := range blockRe.FindAllStringSubmatchIndex(text, -1) {
 		innerStart := loc[blockRe.SubexpIndex("inner")*2]
 		innerEnd := loc[blockRe.SubexpIndex("inner")*2+1]
-		inner := strings.TrimSpace(text[innerStart:innerEnd])
+		lead, mid, trail := splitSurroundingSpace(text[innerStart:innerEnd])
 
 		result.WriteString(text[pos:loc[0]])
 
-		if !fullTokenRe.MatchString(inner) {
+		if !fullTokenRe.MatchString(mid) {
 			// Not encrypted — leave verbatim
 			result.WriteString(text[loc[0]:loc[1]])
 		} else {
-			plaintext, err := decryptFn(inner)
+			plaintext, err := decryptFn(mid)
 			if err != nil {
 				errs = append(errs, err)
 				result.WriteString(text[loc[0]:loc[1]])
 			} else {
-				result.WriteString("<!-- secret -->\n")
+				result.WriteString("<!-- secret -->")
+				result.WriteString(lead)
 				result.WriteString(plaintext)
-				result.WriteString("\n<!-- /secret -->")
+				result.WriteString(trail)
+				result.WriteString("<!-- /secret -->")
 				count++
 			}
 		}
