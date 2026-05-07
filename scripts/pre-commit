@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# .git/hooks/pre-commit
+# Installed by: scripts/install-hooks.sh
+#
+# Blocks commits if any staged .md file contains a likely unencrypted secret
+# outside of an already-encrypted <!-- secret --> block.
+
+set -euo pipefail
+
+staged=$(git diff --cached --name-only --diff-filter=ACM | grep '\.md$' || true)
+[[ -z "$staged" ]] && exit 0
+
+failed=0
+for f in $staged; do
+    [[ -f "$f" ]] || continue
+    if ! mdcrypt scan "$f" > /dev/null 2>&1; then
+        echo "⚠️  mdcrypt: possible unencrypted secret in: $f"
+        mdcrypt scan "$f" || true
+        failed=1
+    fi
+done
+
+if [[ $failed -ne 0 ]]; then
+    cat >&2 <<'EOF'
+
+Commit blocked. To encrypt secrets:
+  1. Wrap the value in your note:
+       <!-- secret -->
+       your-secret-here
+       <!-- /secret -->
+  2. Run: mdcrypt encrypt <file.md>
+  3. Stage the result and commit again.
+
+To bypass (not recommended): git commit --no-verify
+EOF
+    exit 1
+fi
