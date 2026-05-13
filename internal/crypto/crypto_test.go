@@ -1,24 +1,59 @@
 package crypto_test
 
 import (
-	"encoding/base64"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"filippo.io/age"
 
 	"github.com/michael-dez/mdcrypt/internal/crypto"
 )
 
-const (
-	pass    = "correct-horse-battery-staple"
-	testAAD = "/home/user/notes/note.md"
-)
+const passphrase = "correct-horse-battery-staple"
 
-func TestRoundTrip(t *testing.T) {
-	token, err := crypto.Encrypt("hello world", pass, testAAD)
+// testIdentity returns a fresh X25519 identity and the matching recipient.
+func testIdentity(t *testing.T) (*age.X25519Identity, age.Recipient) {
+	t.Helper()
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("GenerateX25519Identity: %v", err)
+	}
+	return id, id.Recipient()
+}
+
+func TestRoundTripX25519(t *testing.T) {
+	id, recipient := testIdentity(t)
+
+	token, err := crypto.Encrypt("hello world", []age.Recipient{recipient})
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
-	got, err := crypto.Decrypt(token, pass)
+	got, err := crypto.Decrypt(token, []age.Identity{id})
+	if err != nil {
+		t.Fatalf("Decrypt: %v", err)
+	}
+	if got != "hello world" {
+		t.Errorf("got %q, want %q", got, "hello world")
+	}
+}
+
+func TestRoundTripPassphrase(t *testing.T) {
+	r, err := crypto.PassphraseRecipient(passphrase)
+	if err != nil {
+		t.Fatalf("PassphraseRecipient: %v", err)
+	}
+	i, err := crypto.PassphraseIdentity(passphrase)
+	if err != nil {
+		t.Fatalf("PassphraseIdentity: %v", err)
+	}
+
+	token, err := crypto.Encrypt("hello world", []age.Recipient{r})
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+	got, err := crypto.Decrypt(token, []age.Identity{i})
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -28,7 +63,8 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestTokenMatchesPattern(t *testing.T) {
-	token, err := crypto.Encrypt("secret", pass, testAAD)
+	_, recipient := testIdentity(t)
+	token, err := crypto.Encrypt("secret", []age.Recipient{recipient})
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
@@ -37,23 +73,26 @@ func TestTokenMatchesPattern(t *testing.T) {
 	}
 }
 
-func TestWrongPassphrase(t *testing.T) {
-	token, err := crypto.Encrypt("secret", pass, testAAD)
+func TestWrongIdentity(t *testing.T) {
+	_, recipient := testIdentity(t)
+	otherID, _ := testIdentity(t)
+
+	token, err := crypto.Encrypt("secret", []age.Recipient{recipient})
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
-	_, err = crypto.Decrypt(token, "wrong-passphrase")
-	if err == nil {
-		t.Fatal("expected error on wrong passphrase, got nil")
+	if _, err := crypto.Decrypt(token, []age.Identity{otherID}); err == nil {
+		t.Fatal("expected error decrypting with wrong identity, got nil")
 	}
 }
 
 func TestNonDeterministic(t *testing.T) {
-	a, err := crypto.Encrypt("same", pass, testAAD)
+	_, recipient := testIdentity(t)
+	a, err := crypto.Encrypt("same", []age.Recipient{recipient})
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := crypto.Encrypt("same", pass, testAAD)
+	b, err := crypto.Encrypt("same", []age.Recipient{recipient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,41 +101,59 @@ func TestNonDeterministic(t *testing.T) {
 	}
 }
 
-func TestAADFileBinding(t *testing.T) {
-	token, err := crypto.Encrypt("secret", pass, "/notes/file1.md")
+func TestMultipleRecipients(t *testing.T) {
+	id1, r1 := testIdentity(t)
+	id2, r2 := testIdentity(t)
+
+	token, err := crypto.Encrypt("shared secret", []age.Recipient{r1, r2})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Encrypt: %v", err)
 	}
 
-	// Tamper: swap the aad field to a different file path
-	m := crypto.TokenPattern.FindStringSubmatch(token)
-	if m == nil {
-		t.Fatal("could not parse token")
-	}
-	newAAD := base64.StdEncoding.EncodeToString([]byte("/notes/file2.md"))
-	oldAAD := m[crypto.TokenPattern.SubexpIndex("aad")]
-	tampered := strings.Replace(token, "aad:"+oldAAD, "aad:"+newAAD, 1)
-
-	_, err = crypto.Decrypt(tampered, pass)
-	if err == nil {
-		t.Fatal("expected decryption to fail with tampered AAD, got nil")
+	for name, id := range map[string]age.Identity{"id1": id1, "id2": id2} {
+		got, err := crypto.Decrypt(token, []age.Identity{id})
+		if err != nil {
+			t.Errorf("%s: Decrypt: %v", name, err)
+			continue
+		}
+		if got != "shared secret" {
+			t.Errorf("%s: got %q, want %q", name, got, "shared secret")
+		}
 	}
 }
 
 func TestMalformedToken(t *testing.T) {
-	_, err := crypto.Decrypt("ENC[garbage]", pass)
-	if err == nil {
+	id, _ := testIdentity(t)
+	if _, err := crypto.Decrypt("ENC[garbage]", []age.Identity{id}); err == nil {
 		t.Fatal("expected error on malformed token")
 	}
 }
 
-func TestMultilinePlaintext(t *testing.T) {
-	plain := "line one\nline two\nline three"
-	token, err := crypto.Encrypt(plain, pass, testAAD)
+func TestEncryptNoRecipients(t *testing.T) {
+	if _, err := crypto.Encrypt("hi", nil); err == nil {
+		t.Fatal("expected error when no recipients provided")
+	}
+}
+
+func TestDecryptNoIdentities(t *testing.T) {
+	_, recipient := testIdentity(t)
+	token, err := crypto.Encrypt("secret", []age.Recipient{recipient})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := crypto.Decrypt(token, pass)
+	if _, err := crypto.Decrypt(token, nil); err == nil {
+		t.Fatal("expected error when no identities provided")
+	}
+}
+
+func TestMultilinePlaintext(t *testing.T) {
+	id, recipient := testIdentity(t)
+	plain := "line one\nline two\nline three"
+	token, err := crypto.Encrypt(plain, []age.Recipient{recipient})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := crypto.Decrypt(token, []age.Identity{id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,16 +163,80 @@ func TestMultilinePlaintext(t *testing.T) {
 }
 
 func TestUnicodePlaintext(t *testing.T) {
+	id, recipient := testIdentity(t)
 	plain := "пароль: 🔑 café"
-	token, err := crypto.Encrypt(plain, pass, testAAD)
+	token, err := crypto.Encrypt(plain, []age.Recipient{recipient})
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := crypto.Decrypt(token, pass)
+	got, err := crypto.Decrypt(token, []age.Identity{id})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != plain {
 		t.Errorf("got %q, want %q", got, plain)
+	}
+}
+
+func TestLoadIdentitiesAndRecipients(t *testing.T) {
+	id, _ := testIdentity(t)
+	dir := t.TempDir()
+
+	idPath := filepath.Join(dir, "identity.txt")
+	if err := os.WriteFile(idPath, []byte(id.String()+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rPath := filepath.Join(dir, "recipients.txt")
+	if err := os.WriteFile(rPath, []byte(id.Recipient().String()+"\n# a comment\n\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rs, err := crypto.LoadRecipients(rPath)
+	if err != nil {
+		t.Fatalf("LoadRecipients: %v", err)
+	}
+	if len(rs) != 1 {
+		t.Fatalf("got %d recipients, want 1", len(rs))
+	}
+
+	ids, err := crypto.LoadIdentities(idPath)
+	if err != nil {
+		t.Fatalf("LoadIdentities: %v", err)
+	}
+	if len(ids) != 1 {
+		t.Fatalf("got %d identities, want 1", len(ids))
+	}
+
+	token, err := crypto.Encrypt("from-file", rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := crypto.Decrypt(token, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "from-file" {
+		t.Errorf("round trip via file-loaded keys: got %q", got)
+	}
+}
+
+func TestParseRecipient(t *testing.T) {
+	_, recipient := testIdentity(t)
+	r, err := crypto.ParseRecipient(recipient.(*age.X25519Recipient).String())
+	if err != nil {
+		t.Fatalf("ParseRecipient: %v", err)
+	}
+	if r == nil {
+		t.Fatal("got nil recipient")
+	}
+}
+
+func TestParseRecipientRejectsGarbage(t *testing.T) {
+	if _, err := crypto.ParseRecipient("not-a-real-recipient"); err == nil {
+		t.Error("expected error parsing garbage recipient")
+	}
+	if _, err := crypto.ParseRecipient(strings.Repeat("x", 80)); err == nil {
+		t.Error("expected error parsing garbage recipient")
 	}
 }

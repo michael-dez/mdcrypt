@@ -1,156 +1,138 @@
-// Package crypto provides the low-level encryption primitives for mdcrypt.
+// Package crypto provides the encryption primitives for mdcrypt.
 //
-// Each ENC token is fully self-contained:
+// Each ENC token wraps an age (https://age-encryption.org) ciphertext as
+// base64 inside a single self-contained string:
 //
-//	ENC[AES256_GCM,data:<b64>,iv:<b64>,tag:<b64>,aad:<b64>]
+//	ENC[AGE,data:<b64>]
 //
-//	data = 16-byte Argon2id salt || AES-GCM ciphertext
-//	iv   = 12-byte random nonce
-//	tag  = 16-byte GCM authentication tag
-//	aad  = base64(resolved file path) — binds the token to its source file
+// The age payload is in age's binary format (header + payload), so it
+// already carries everything needed to decrypt — recipient stanzas, nonces,
+// authentication tags, etc. — given the matching identity.
 package crypto
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 
-	"golang.org/x/crypto/argon2"
-)
-
-const (
-	saltLen = 16
-	keyLen  = 32 // AES-256
-	ivLen   = 12
-	tagLen  = 16
-
-	// Argon2id parameters
-	argonTime    = 3
-	argonMemory  = 64 * 1024 // 64 MiB
-	argonThreads = 2
+	"filippo.io/age"
 )
 
 // TokenPattern matches a complete ENC[...] token.
 var TokenPattern = regexp.MustCompile(
-	`ENC\[AES256_GCM,` +
-		`data:(?P<data>[A-Za-z0-9+/=]+),` +
-		`iv:(?P<iv>[A-Za-z0-9+/=]+),` +
-		`tag:(?P<tag>[A-Za-z0-9+/=]+),` +
-		`aad:(?P<aad>[A-Za-z0-9+/=]+)\]`,
+	`ENC\[AGE,data:(?P<data>[A-Za-z0-9+/=]+)\]`,
 )
 
-// FileAAD returns the AAD string used to bind a token to a file.
-func FileAAD(resolvedPath string) string {
-	return resolvedPath
+// Encrypt encrypts plaintext to the given age recipients and returns a
+// self-contained ENC token. At least one recipient is required.
+func Encrypt(plaintext string, recipients []age.Recipient) (string, error) {
+	if len(recipients) == 0 {
+		return "", errors.New("no recipients provided")
+	}
+
+	var buf bytes.Buffer
+	w, err := age.Encrypt(&buf, recipients...)
+	if err != nil {
+		return "", fmt.Errorf("age encrypt: %w", err)
+	}
+	if _, err := io.WriteString(w, plaintext); err != nil {
+		return "", fmt.Errorf("writing plaintext: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("finalizing ciphertext: %w", err)
+	}
+
+	return fmt.Sprintf("ENC[AGE,data:%s]", base64.StdEncoding.EncodeToString(buf.Bytes())), nil
 }
 
-// Encrypt encrypts plaintext with AES-256-GCM and returns a self-contained
-// ENC[...] token. aad should be the resolved absolute path of the target file.
-func Encrypt(plaintext, passphrase, aad string) (string, error) {
-	salt := make([]byte, saltLen)
-	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
-		return "", fmt.Errorf("generating salt: %w", err)
-	}
-
-	iv := make([]byte, ivLen)
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return "", fmt.Errorf("generating iv: %w", err)
-	}
-
-	key := deriveKey(passphrase, salt)
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("creating cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("creating GCM: %w", err)
-	}
-
-	// Seal appends the tag to the ciphertext: result = ct || tag
-	sealed := gcm.Seal(nil, iv, []byte(plaintext), []byte(aad))
-	ct := sealed[:len(sealed)-tagLen]
-	tag := sealed[len(sealed)-tagLen:]
-
-	data := base64.StdEncoding.EncodeToString(append(salt, ct...))
-	ivB64 := base64.StdEncoding.EncodeToString(iv)
-	tagB64 := base64.StdEncoding.EncodeToString(tag)
-	aadB64 := base64.StdEncoding.EncodeToString([]byte(aad))
-
-	return fmt.Sprintf(
-		"ENC[AES256_GCM,data:%s,iv:%s,tag:%s,aad:%s]",
-		data, ivB64, tagB64, aadB64,
-	), nil
-}
-
-// Decrypt decrypts a single ENC[...] token and returns the plaintext.
-// Returns an error on wrong passphrase, tampering, or malformed token.
-func Decrypt(token, passphrase string) (string, error) {
+// Decrypt decrypts a single ENC token using the supplied identities.
+// Returns an error on malformed tokens, no matching identity, or tampering.
+func Decrypt(token string, identities []age.Identity) (string, error) {
 	m := TokenPattern.FindStringSubmatch(token)
 	if m == nil {
 		return "", fmt.Errorf("not a valid ENC token: %q", token)
 	}
-
-	idx := func(name string) string {
-		return m[TokenPattern.SubexpIndex(name)]
+	if len(identities) == 0 {
+		return "", errors.New("no identities provided")
 	}
 
-	rawData, err := base64.StdEncoding.DecodeString(idx("data"))
-	if err != nil || len(rawData) < saltLen {
+	raw, err := base64.StdEncoding.DecodeString(m[TokenPattern.SubexpIndex("data")])
+	if err != nil {
 		return "", errors.New("malformed token: bad data field")
 	}
-	salt, ct := rawData[:saltLen], rawData[saltLen:]
 
-	iv, err := base64.StdEncoding.DecodeString(idx("iv"))
+	r, err := age.Decrypt(bytes.NewReader(raw), identities...)
 	if err != nil {
-		return "", errors.New("malformed token: bad iv field")
+		return "", fmt.Errorf("decryption failed: %w", err)
 	}
-
-	tag, err := base64.StdEncoding.DecodeString(idx("tag"))
+	plaintext, err := io.ReadAll(r)
 	if err != nil {
-		return "", errors.New("malformed token: bad tag field")
+		return "", fmt.Errorf("reading plaintext: %w", err)
 	}
-
-	aad, err := base64.StdEncoding.DecodeString(idx("aad"))
-	if err != nil {
-		return "", errors.New("malformed token: bad aad field")
-	}
-
-	key := deriveKey(passphrase, salt)
-
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", fmt.Errorf("creating cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return "", fmt.Errorf("creating GCM: %w", err)
-	}
-
-	// GCM.Open expects ct || tag
-	plaintext, err := gcm.Open(nil, iv, append(ct, tag...), aad)
-	if err != nil {
-		return "", errors.New("decryption failed — wrong passphrase, corrupted token, or wrong file")
-	}
-
 	return string(plaintext), nil
 }
 
-func deriveKey(passphrase string, salt []byte) []byte {
-	return argon2.IDKey(
-		[]byte(passphrase),
-		salt,
-		argonTime,
-		argonMemory,
-		argonThreads,
-		keyLen,
-	)
+// LoadRecipients parses an age recipients file (one recipient per line,
+// `#` comments and blank lines ignored). Suitable for ~/.config/mdcrypt/recipients.txt.
+func LoadRecipients(path string) ([]age.Recipient, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening recipients file: %w", err)
+	}
+	defer f.Close()
+
+	rs, err := age.ParseRecipients(f)
+	if err != nil {
+		return nil, fmt.Errorf("parsing recipients in %s: %w", path, err)
+	}
+	if len(rs) == 0 {
+		return nil, fmt.Errorf("no recipients found in %s", path)
+	}
+	return rs, nil
+}
+
+// ParseRecipient parses a single age recipient string (e.g. "age1...").
+func ParseRecipient(s string) (age.Recipient, error) {
+	rs, err := age.ParseRecipients(bytes.NewReader([]byte(s + "\n")))
+	if err != nil {
+		return nil, err
+	}
+	if len(rs) != 1 {
+		return nil, fmt.Errorf("expected 1 recipient, got %d", len(rs))
+	}
+	return rs[0], nil
+}
+
+// LoadIdentities parses an age identity file. A single file may hold
+// multiple identities; all are returned and any may be used at decrypt time.
+func LoadIdentities(path string) ([]age.Identity, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening identity file: %w", err)
+	}
+	defer f.Close()
+
+	ids, err := age.ParseIdentities(f)
+	if err != nil {
+		return nil, fmt.Errorf("parsing identities in %s: %w", path, err)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no identities found in %s", path)
+	}
+	return ids, nil
+}
+
+// PassphraseRecipient wraps a passphrase as an age scrypt recipient,
+// for users who prefer a memorized secret over a key file.
+func PassphraseRecipient(passphrase string) (age.Recipient, error) {
+	return age.NewScryptRecipient(passphrase)
+}
+
+// PassphraseIdentity wraps a passphrase as an age scrypt identity.
+func PassphraseIdentity(passphrase string) (age.Identity, error) {
+	return age.NewScryptIdentity(passphrase)
 }

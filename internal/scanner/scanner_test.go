@@ -5,14 +5,19 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
+
 	"github.com/michael-dez/mdcrypt/internal/crypto"
 	"github.com/michael-dez/mdcrypt/internal/scanner"
 )
 
-const (
-	pass    = "correct-horse-battery-staple"
-	testAAD = "/home/user/notes/note.md"
-)
+var testRecipients = func() []age.Recipient {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		panic(err)
+	}
+	return []age.Recipient{id.Recipient()}
+}()
 
 func scan(text string) []scanner.Finding {
 	return scanner.ScanText(text, "test.md")
@@ -55,7 +60,7 @@ func TestCleanDocNoFindings(t *testing.T) {
 }
 
 func TestSkipsEncTokenLines(t *testing.T) {
-	token, err := crypto.Encrypt("sk-proj-SECRET", pass, testAAD)
+	token, err := crypto.Encrypt("sk-proj-SECRET", testRecipients)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +71,7 @@ func TestSkipsEncTokenLines(t *testing.T) {
 }
 
 func TestSkipsEncryptedBlockContents(t *testing.T) {
-	token, err := crypto.Encrypt("AKIAIOSFODNN7EXAMPLE", pass, testAAD)
+	token, err := crypto.Encrypt("AKIAIOSFODNN7EXAMPLE", testRecipients)
 	if err != nil {
 		t.Fatal(err)
 	}

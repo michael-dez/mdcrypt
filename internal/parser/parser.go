@@ -9,7 +9,7 @@
 // When encrypted the inner content is replaced with a single ENC token:
 //
 //	<!-- secret -->
-//	ENC[AES256_GCM,data:...,iv:...,tag:...,aad:...]
+//	ENC[AGE,data:...]
 //	<!-- /secret -->
 package parser
 

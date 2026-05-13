@@ -4,13 +4,23 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
+
 	"github.com/michael-dez/mdcrypt/internal/crypto"
 	"github.com/michael-dez/mdcrypt/internal/parser"
 )
 
-const (
-	pass    = "correct-horse-battery-staple"
-	testAAD = "/home/user/notes/note.md"
+var testIdentity = func() *age.X25519Identity {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		panic(err)
+	}
+	return id
+}()
+
+var (
+	testRecipients = []age.Recipient{testIdentity.Recipient()}
+	testIdentities = []age.Identity{testIdentity}
 )
 
 var plainDoc = strings.TrimSpace(`
@@ -26,11 +36,11 @@ More prose.
 `)
 
 func encFn(pt string) (string, error) {
-	return crypto.Encrypt(pt, pass, testAAD)
+	return crypto.Encrypt(pt, testRecipients)
 }
 
 func decFn(tok string) (string, error) {
-	return crypto.Decrypt(tok, pass)
+	return crypto.Decrypt(tok, testIdentities)
 }
 
 func TestFindBlocksPlaintext(t *testing.T) {
@@ -230,14 +240,18 @@ func TestEncryptPreservesInlineFormatting(t *testing.T) {
 	}
 }
 
-func TestWrongPassLeavesBlockIntact(t *testing.T) {
+func TestWrongIdentityLeavesBlockIntact(t *testing.T) {
 	enc, err := parser.EncryptBlocks(plainDoc, encFn)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	otherID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
 	badDecFn := func(tok string) (string, error) {
-		return crypto.Decrypt(tok, "wrong-pass")
+		return crypto.Decrypt(tok, []age.Identity{otherID})
 	}
 
 	dec := parser.DecryptBlocks(enc.Text, badDecFn)
@@ -245,7 +259,7 @@ func TestWrongPassLeavesBlockIntact(t *testing.T) {
 		t.Errorf("Count = %d, want 0 (all should fail)", dec.Count)
 	}
 	if len(dec.Errors) == 0 {
-		t.Error("expected errors from bad passphrase")
+		t.Error("expected errors from wrong identity")
 	}
 	if !parser.HasEncryptedBlocks(dec.Text) {
 		t.Error("block should remain encrypted on failure")

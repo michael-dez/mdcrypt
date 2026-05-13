@@ -24,7 +24,7 @@ After encrypting:
 Some ordinary prose.
 
 <!-- secret -->
-ENC[AES256_GCM,data:a1b2c3...,iv:d4e5f6...,tag:g7h8i9...,aad:L2hvbWU...]
+ENC[AGE,data:YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB...]
 <!-- /secret -->
 
 More ordinary prose.
@@ -36,16 +36,17 @@ The `<!-- secret -->` / `<!-- /secret -->` tags are **invisible in rendered mark
 
 ## Security model
 
+mdcrypt uses [age](https://age-encryption.org) for all encryption. Each `ENC[AGE,data:...]` token is a base64-wrapped age ciphertext — already a complete, self-contained format with its own header, nonce, and authentication tag.
+
 | Property | Implementation |
 |---|---|
-| Encryption | AES-256-GCM (authenticated encryption) |
-| Key derivation | Argon2id — memory-hard, GPU-resistant |
-| Salt | 16 random bytes per token, embedded in the token itself |
-| Nonce | 12 random bytes per encryption call |
-| File binding | AAD = resolved absolute file path; a token cannot be copy-pasted into another file and decrypted |
-| Integrity | GCM authentication tag — any tampering is detected at decrypt time |
+| Primitives | X25519 + ChaCha20-Poly1305 (via age) |
+| Key format | Standard age `AGE-SECRET-KEY-...` identities and `age1...` recipients |
+| Multi-recipient | Encrypt once to several recipients; any matching identity decrypts |
+| Passphrase mode | Optional scrypt-based fallback for users without a key file |
+| Integrity | Poly1305 authentication tag — any tampering is detected at decrypt time |
 
-The passphrase never touches disk. It is read from `$MDCRYPT_KEY` or via a secure terminal prompt.
+No secret material is stored inside the encrypted file — the age recipients/identities live entirely outside the markdown.
 
 ---
 
@@ -64,11 +65,29 @@ mv mdcrypt ~/bin/   # or anywhere on $PATH
 
 ---
 
+## Key setup
+
+mdcrypt does not generate keys itself — use the standard [`age-keygen`](https://age-encryption.org) tool:
+
+```bash
+mkdir -p ~/.config/mdcrypt
+age-keygen -o ~/.config/mdcrypt/identity.txt
+
+# extract the matching public key (recipient) into recipients.txt
+grep '^# public key:' ~/.config/mdcrypt/identity.txt \
+  | sed 's/^# public key: //' \
+  > ~/.config/mdcrypt/recipients.txt
+```
+
+After this, `mdcrypt encrypt` and `mdcrypt view` work with no flags.
+
+To encrypt for multiple recipients (e.g. yourself + a teammate), append their public keys to `recipients.txt` — one per line.
+
+---
+
 ## Usage
 
 ### 1. Mark secrets in your note
-
-Wrap any sensitive value in a secret block:
 
 ```markdown
 <!-- secret -->
@@ -84,7 +103,13 @@ The block can contain multiple lines — the entire inner content is encrypted a
 mdcrypt encrypt note.md
 ```
 
-Prompts for a passphrase (with confirmation), then replaces every unencrypted `<!-- secret -->` block in-place. Already-encrypted blocks are left untouched.
+Replaces every unencrypted `<!-- secret -->` block in-place. Already-encrypted blocks are left untouched.
+
+You can override the recipient(s) inline:
+
+```bash
+mdcrypt encrypt -r age1abc... -r age1def... note.md
+```
 
 ### 3. View decrypted (safe — stdout only, never writes to disk)
 
@@ -110,20 +135,32 @@ mdcrypt scan note.md      # scans a single file
 
 ---
 
-## Environment variable
+## Key resolution
 
-Set `MDCRYPT_KEY` to skip interactive prompts (e.g. in scripts or CI):
+**Recipients** (used by `encrypt`), in order of precedence:
+
+1. `-r/--recipient age1...` flags (repeatable)
+2. `$MDCRYPT_RECIPIENTS` — path to a recipients file
+3. `~/.config/mdcrypt/recipients.txt`
+
+**Identities** (used by `decrypt` and `view`):
+
+1. `-i/--identity <path>` flags (repeatable)
+2. `$MDCRYPT_IDENTITY` — path to an identity file
+3. `~/.config/mdcrypt/identity.txt`
+
+---
+
+## Passphrase mode
+
+If you'd rather memorize a passphrase than manage a key file, pass `--passphrase` on either side:
 
 ```bash
-export MDCRYPT_KEY="my-passphrase"
-mdcrypt view note.md
+mdcrypt encrypt --passphrase note.md   # prompts twice (with confirmation)
+mdcrypt view --passphrase note.md      # prompts once
 ```
 
-To set it without leaving a trace in shell history:
-
-```bash
-read -rs MDCRYPT_KEY && export MDCRYPT_KEY
-```
+This uses age's standard scrypt recipient/identity, so the resulting tokens are still in the `ENC[AGE,...]` format and remain decryptable with the `age` CLI.
 
 ---
 
@@ -142,17 +179,10 @@ The hook runs `mdcrypt scan` on every staged `.md` file and aborts the commit if
 ## ENC token format
 
 ```
-ENC[AES256_GCM,data:<base64>,iv:<base64>,tag:<base64>,aad:<base64>]
+ENC[AGE,data:<base64>]
 ```
 
-| Field  | Contents |
-|--------|----------|
-| `data` | 16-byte Argon2id salt ‖ AES-GCM ciphertext, base64-encoded |
-| `iv`   | 12-byte random nonce |
-| `tag`  | 16-byte GCM authentication tag |
-| `aad`  | base64-encoded resolved file path (additional authenticated data) |
-
-Each token is fully self-contained — no sidecar files, no key registry.
+`data` is the standard [age binary ciphertext](https://age-encryption.org), base64-encoded. Because it's a real age payload, you can also decrypt it with the upstream `age` CLI after base64-decoding the `data:` field.
 
 ---
 
@@ -170,10 +200,9 @@ Each token is fully self-contained — no sidecar files, no key registry.
 
 ## Limitations
 
-- mdcrypt does not manage your passphrase — use your OS keychain or a password manager.
+- mdcrypt does not manage your keys — use `age-keygen` and keep your identity file safe.
 - The `scan` patterns are heuristic and won't catch every type of secret.
 - `--inplace` decrypt writes plaintext to disk temporarily. Prefer `view` when you only need to read.
-- AAD binding means if you **rename or move** a file, existing tokens can no longer be decrypted. Decrypt before moving, then re-encrypt after.
 
 ---
 
